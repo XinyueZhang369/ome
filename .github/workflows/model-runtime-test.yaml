@@ -272,21 +272,19 @@ jobs:
               MODEL_ELAPSED=0
 
               while [ $MODEL_ELAPSED -lt $MODEL_TIMEOUT ]; do
-                MODEL_READY=$(kubectl get clusterbasemodel "$MODEL_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
-                MODEL_REASON=$(kubectl get clusterbasemodel "$MODEL_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || echo "")
+                MODEL_READY=$(kubectl get clusterbasemodel "$MODEL_NAME" -o jsonpath='{.status.state}' 2>/dev/null || echo "Unknown")
 
-                echo "ClusterBaseModel Ready: $MODEL_READY (reason: $MODEL_REASON) - ${MODEL_ELAPSED}s elapsed"
+                echo "ClusterBaseModel Ready: $MODEL_READY - ${MODEL_ELAPSED}s elapsed"
 
-                if [ "$MODEL_READY" = "True" ]; then
+                if [ "$MODEL_READY" = "Ready" ]; then
                   echo "ClusterBaseModel is ready!"
                   break
                 fi
 
                 # Check for failure
-                if echo "$MODEL_REASON" | grep -qiE "^Failed$|Error"; then
-                  MODEL_MESSAGE=$(kubectl get clusterbasemodel "$MODEL_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "")
-                  echo "ClusterBaseModel failed: $MODEL_REASON - $MODEL_MESSAGE"
-                  ERROR_MSG="ClusterBaseModel failed: $MODEL_REASON - $MODEL_MESSAGE"
+                if echo "$MODEL_READY" | grep -qiE "^Failed$|Error"; then
+                  echo "ClusterBaseModel failed"
+                  ERROR_MSG="ClusterBaseModel failed"
                   RESULT="FAILED"
                   break
                 fi
