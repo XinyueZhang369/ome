@@ -11,9 +11,9 @@ on:
         default: ""
         type: string
       max_parallel:
-        description: "Maximum number of models to test in parallel"
+        description: "Maximum number of parallel runners (models will be batched)"
         required: false
-        default: "5"
+        default: "3"
         type: string
 
 env:
@@ -23,13 +23,14 @@ jobs:
   discover-models:
     runs-on: ubuntu-latest
     outputs:
-      models: ${{ steps.discover.outputs.models }}
+      batches: ${{ steps.discover.outputs.batches }}
+      batch_count: ${{ steps.discover.outputs.batch_count }}
       model_count: ${{ steps.discover.outputs.model_count }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Discover models with runtime and service files
+      - name: Discover models and create batches
         id: discover
         run: |
           echo "Discovering models with matching runtime and service files..."
@@ -152,23 +153,55 @@ jobs:
           echo "Total models found with runtime and service: $MODEL_COUNT"
           echo "=========================================="
 
+          # Get max_parallel value
+          MAX_PARALLEL="${{ github.event.inputs.max_parallel }}"
+          if [ -z "$MAX_PARALLEL" ]; then
+            MAX_PARALLEL=5
+          fi
+
+          echo "Max parallel runners: $MAX_PARALLEL"
+
+          # Calculate batch size and create batches
+          if [ $MODEL_COUNT -eq 0 ]; then
+            BATCHES_JSON="[]"
+            BATCH_COUNT=0
+          else
+            # Calculate how many models per batch (ceiling division)
+            BATCH_SIZE=$(( (MODEL_COUNT + MAX_PARALLEL - 1) / MAX_PARALLEL ))
+            echo "Models per batch: $BATCH_SIZE"
+
+            # Create batches - each batch contains a list of models
+            BATCHES_JSON=$(echo "$MODELS_JSON" | jq -c --argjson size "$BATCH_SIZE" '
+              [range(0; length; $size)] as $indices |
+              [$indices[] as $i | .[$i:$i+$size]] |
+              to_entries |
+              map({batch_index: .key, models: .value})
+            ')
+            BATCH_COUNT=$(echo "$BATCHES_JSON" | jq 'length')
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Created $BATCH_COUNT batches"
+          echo "=========================================="
+
           # Output for matrix strategy
-          echo "models=$(echo "$MODELS_JSON" | jq -c '.')" >> $GITHUB_OUTPUT
+          echo "batches=$(echo "$BATCHES_JSON" | jq -c '.')" >> $GITHUB_OUTPUT
+          echo "batch_count=$BATCH_COUNT" >> $GITHUB_OUTPUT
           echo "model_count=$MODEL_COUNT" >> $GITHUB_OUTPUT
 
-          # Also output the full list for debugging
-          echo "Models to test:"
-          echo "$MODELS_JSON" | jq -r '.[].model_name'
+          # Also output the batch distribution for debugging
+          echo "Batch distribution:"
+          echo "$BATCHES_JSON" | jq -r '.[] | "Batch \(.batch_index): \(.models | length) models - \([.models[].model_name] | join(", "))"'
 
-  test-model:
+  test-batch:
     needs: discover-models
-    if: needs.discover-models.outputs.model_count != '0'
+    if: needs.discover-models.outputs.batch_count != '0'
     runs-on: k8s-runner
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(github.event.inputs.max_parallel || '5') }}
       matrix:
-        model: ${{ fromJson(needs.discover-models.outputs.models) }}
+        batch: ${{ fromJson(needs.discover-models.outputs.batches) }}
 
     steps:
       - name: Checkout repository
@@ -179,239 +212,250 @@ jobs:
         with:
           version: 'v1.30.1'
 
-      - name: Test model - ${{ matrix.model.model_name }}
+      - name: Test batch ${{ matrix.batch.batch_index }}
         id: test
         run: |
           set +e  # Don't exit on error, we want to capture results
 
-          MODEL_NAME="${{ matrix.model.model_name }}"
-          MODEL_FILE="${{ matrix.model.model_file }}"
-          RUNTIME_FILE="${{ matrix.model.runtime_file }}"
-          RUNTIME_NAME="${{ matrix.model.runtime_name }}"
-          SERVICE_FILE="${{ matrix.model.service_file }}"
           NAMESPACE="${{ env.K8S_NAMESPACE }}"
-          ORG="${{ matrix.model.org }}"
+          BATCH_INDEX="${{ matrix.batch.batch_index }}"
+          MODELS_JSON='${{ toJson(matrix.batch.models) }}'
 
           echo "=========================================="
-          echo "Testing model: $MODEL_NAME"
+          echo "Testing batch $BATCH_INDEX"
           echo "Namespace: $NAMESPACE"
           echo "=========================================="
 
-          # Initialize result
-          RESULT="PENDING"
-          ERROR_MSG=""
+          # Create results directory
+          mkdir -p test-results
 
-          # Extract the served-model-name from the runtime file for API calls
-          SERVED_MODEL_NAME=$(grep -A1 -- "--served-model-name" "$RUNTIME_FILE" | tail -1 | sed 's/^[[:space:]]*- //' | tr -d '"' || echo "$MODEL_NAME")
-          echo "Served model name: $SERVED_MODEL_NAME"
+          # Get total models in this batch
+          TOTAL_MODELS=$(echo "$MODELS_JSON" | jq 'length')
+          echo "Models in this batch: $TOTAL_MODELS"
 
-          # Step 1: Apply model YAML
-          echo "Applying model: $MODEL_FILE"
-          if ! kubectl apply -f "$MODEL_FILE" 2>&1; then
-            ERROR_MSG="Failed to apply model YAML"
-            RESULT="FAILED"
-          fi
+          # Process each model in the batch sequentially
+          MODEL_INDEX=0
+          echo "$MODELS_JSON" | jq -c '.[]' | while read -r MODEL; do
+            MODEL_INDEX=$((MODEL_INDEX + 1))
 
-          # Step 2: Apply runtime YAML
-          if [ "$RESULT" != "FAILED" ]; then
-            echo "Applying runtime: $RUNTIME_FILE"
-            if ! kubectl apply -f "$RUNTIME_FILE" 2>&1; then
-              ERROR_MSG="Failed to apply runtime YAML"
+            MODEL_NAME=$(echo "$MODEL" | jq -r '.model_name')
+            MODEL_FILE=$(echo "$MODEL" | jq -r '.model_file')
+            RUNTIME_FILE=$(echo "$MODEL" | jq -r '.runtime_file')
+            RUNTIME_NAME=$(echo "$MODEL" | jq -r '.runtime_name')
+            SERVICE_FILE=$(echo "$MODEL" | jq -r '.service_file')
+            ORG=$(echo "$MODEL" | jq -r '.org')
+
+            echo ""
+            echo "=========================================="
+            echo "[$MODEL_INDEX/$TOTAL_MODELS] Testing model: $MODEL_NAME"
+            echo "=========================================="
+
+            # Initialize result
+            RESULT="PENDING"
+            ERROR_MSG=""
+
+            # Extract the served-model-name from the runtime file for API calls
+            SERVED_MODEL_NAME=$(grep -A1 -- "--served-model-name" "$RUNTIME_FILE" | tail -1 | sed 's/^[[:space:]]*- //' | tr -d '"' || echo "$MODEL_NAME")
+            echo "Served model name: $SERVED_MODEL_NAME"
+
+            # Step 1: Apply model YAML
+            echo "Applying model: $MODEL_FILE"
+            if ! kubectl apply -f "$MODEL_FILE" 2>&1; then
+              ERROR_MSG="Failed to apply model YAML"
               RESULT="FAILED"
             fi
-          fi
 
-          # Step 3: Apply service YAML (modify namespace to actions-runner-system)
-          if [ "$RESULT" != "FAILED" ]; then
-            echo "Applying service: $SERVICE_FILE"
-            # Create a temp file with the namespace set
-            TEMP_SERVICE="/tmp/service-$MODEL_NAME.yaml"
-
-            # Read the service file and update namespace
-            cat "$SERVICE_FILE" | sed "s/namespace:.*/namespace: $NAMESPACE/" > "$TEMP_SERVICE"
-
-            # Also ensure minReplicas is at least 1 for engine
-            sed -i 's/minReplicas: 0/minReplicas: 1/' "$TEMP_SERVICE" 2>/dev/null || \
-              sed -i '' 's/minReplicas: 0/minReplicas: 1/' "$TEMP_SERVICE"
-
-            if ! kubectl apply -f "$TEMP_SERVICE" 2>&1; then
-              ERROR_MSG="Failed to apply service YAML"
-              RESULT="FAILED"
-            fi
-            rm -f "$TEMP_SERVICE"
-          fi
-
-          # Step 4: Wait for pods to be ready
-          if [ "$RESULT" != "FAILED" ]; then
-            echo "Waiting for pods to be ready..."
-            TIMEOUT=1800  # 30 minutes
-            ELAPSED=0
-            ENGINE_READY=false
-            ROUTER_READY=false
-
-            while [ $ELAPSED -lt $TIMEOUT ]; do
-              # Check engine pod
-              ENGINE_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
-              ENGINE_READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
-
-              # Check router pod
-              ROUTER_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
-              ROUTER_READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
-
-              echo "Engine: $ENGINE_STATUS (ready: $ENGINE_READY_COUNT), Router: $ROUTER_STATUS (ready: $ROUTER_READY_COUNT) - ${ELAPSED}s elapsed"
-
-              if [ "$ENGINE_READY_COUNT" = "true" ]; then
-                ENGINE_READY=true
-              fi
-
-              if [ "$ROUTER_READY_COUNT" = "true" ]; then
-                ROUTER_READY=true
-              fi
-
-              if [ "$ENGINE_READY" = "true" ] && [ "$ROUTER_READY" = "true" ]; then
-                echo "All pods are ready!"
-                break
-              fi
-
-              # Check for CrashLoopBackOff or Error
-              POD_STATUSES=$(kubectl get pods -n "$NAMESPACE" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || echo "")
-              if echo "$POD_STATUSES" | grep -qE "CrashLoopBackOff|ImagePullBackOff|ErrImagePull"; then
-                echo "Pod in error state: $POD_STATUSES"
-                ERROR_MSG="Pod failed: $POD_STATUSES"
-                RESULT="FAILED"
-                break
-              fi
-
-              sleep 30
-              ELAPSED=$((ELAPSED + 30))
-            done
-
-            if [ $ELAPSED -ge $TIMEOUT ] && [ "$RESULT" != "FAILED" ]; then
-              ERROR_MSG="Timeout waiting for pods to be ready"
-              RESULT="FAILED"
-            fi
-          fi
-
-          # Step 5: Test inference service status
-          if [ "$RESULT" != "FAILED" ]; then
-            echo "Testing inference service status..."
-
-            # Get the InferenceService status URL
-            ISVC_URL=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.url}' 2>/dev/null)
-
-            if [ -z "$ISVC_URL" ]; then
-              echo "InferenceService URL not found, checking status directly..."
-              ISVC_STATUS=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-
-              if [ "$ISVC_STATUS" = "True" ]; then
-                echo "InferenceService is Ready"
-                RESULT="PASSED"
-              else
-                ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
-                ISVC_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null)
-                ERROR_MSG="InferenceService not ready: $ISVC_REASON - $ISVC_MESSAGE"
+            # Step 2: Apply runtime YAML
+            if [ "$RESULT" != "FAILED" ]; then
+              echo "Applying runtime: $RUNTIME_FILE"
+              if ! kubectl apply -f "$RUNTIME_FILE" 2>&1; then
+                ERROR_MSG="Failed to apply runtime YAML"
                 RESULT="FAILED"
               fi
-            else
-              echo "InferenceService URL: $ISVC_URL"
+            fi
 
-              # Test the status endpoint
-              echo "Testing inference service status endpoint..."
-              STATUS_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/v1/models" 2>&1)
-              STATUS_EXIT=$?
+            # Step 3: Apply service YAML (modify namespace to actions-runner-system)
+            if [ "$RESULT" != "FAILED" ]; then
+              echo "Applying service: $SERVICE_FILE"
+              # Create a temp file with the namespace set
+              TEMP_SERVICE="/tmp/service-$MODEL_NAME.yaml"
 
-              echo "Status response: $STATUS_RESPONSE"
+              # Read the service file and update namespace
+              cat "$SERVICE_FILE" | sed "s/namespace:.*/namespace: $NAMESPACE/" > "$TEMP_SERVICE"
 
-              if [ $STATUS_EXIT -eq 0 ] && echo "$STATUS_RESPONSE" | grep -q '"data"'; then
-                echo "InferenceService status test PASSED"
-                RESULT="PASSED"
-              else
-                # Check if the service is at least reachable
-                HEALTH_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/health" 2>&1)
-                HEALTH_EXIT=$?
+              # Also ensure minReplicas is at least 1 for engine
+              sed -i 's/minReplicas: 0/minReplicas: 1/' "$TEMP_SERVICE" 2>/dev/null || \
+                sed -i '' 's/minReplicas: 0/minReplicas: 1/' "$TEMP_SERVICE"
 
-                if [ $HEALTH_EXIT -eq 0 ]; then
-                  echo "Health check passed"
+              if ! kubectl apply -f "$TEMP_SERVICE" 2>&1; then
+                ERROR_MSG="Failed to apply service YAML"
+                RESULT="FAILED"
+              fi
+              rm -f "$TEMP_SERVICE"
+            fi
+
+            # Step 4: Wait for pods to be ready
+            if [ "$RESULT" != "FAILED" ]; then
+              echo "Waiting for pods to be ready..."
+              TIMEOUT=1800  # 30 minutes
+              ELAPSED=0
+              ENGINE_READY=false
+              ROUTER_READY=false
+
+              while [ $ELAPSED -lt $TIMEOUT ]; do
+                # Check engine pod
+                ENGINE_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+                ENGINE_READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+
+                # Check router pod
+                ROUTER_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+                ROUTER_READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+
+                echo "Engine: $ENGINE_STATUS (ready: $ENGINE_READY_COUNT), Router: $ROUTER_STATUS (ready: $ROUTER_READY_COUNT) - ${ELAPSED}s elapsed"
+
+                if [ "$ENGINE_READY_COUNT" = "true" ]; then
+                  ENGINE_READY=true
+                fi
+
+                if [ "$ROUTER_READY_COUNT" = "true" ]; then
+                  ROUTER_READY=true
+                fi
+
+                if [ "$ENGINE_READY" = "true" ] && [ "$ROUTER_READY" = "true" ]; then
+                  echo "All pods are ready!"
+                  break
+                fi
+
+                # Check for CrashLoopBackOff or Error
+                POD_STATUSES=$(kubectl get pods -n "$NAMESPACE" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || echo "")
+                if echo "$POD_STATUSES" | grep -qE "CrashLoopBackOff|ImagePullBackOff|ErrImagePull"; then
+                  echo "Pod in error state: $POD_STATUSES"
+                  ERROR_MSG="Pod failed: $POD_STATUSES"
+                  RESULT="FAILED"
+                  break
+                fi
+
+                sleep 30
+                ELAPSED=$((ELAPSED + 30))
+              done
+
+              if [ $ELAPSED -ge $TIMEOUT ] && [ "$RESULT" != "FAILED" ]; then
+                ERROR_MSG="Timeout waiting for pods to be ready"
+                RESULT="FAILED"
+              fi
+            fi
+
+            # Step 5: Test inference service status
+            if [ "$RESULT" != "FAILED" ]; then
+              echo "Testing inference service status..."
+
+              # Get the InferenceService status URL
+              ISVC_URL=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.url}' 2>/dev/null)
+
+              if [ -z "$ISVC_URL" ]; then
+                echo "InferenceService URL not found, checking status directly..."
+                ISVC_STATUS=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+
+                if [ "$ISVC_STATUS" = "True" ]; then
+                  echo "InferenceService is Ready"
                   RESULT="PASSED"
                 else
-                  ERROR_MSG="InferenceService endpoint unreachable"
+                  ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
+                  ISVC_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null)
+                  ERROR_MSG="InferenceService not ready: $ISVC_REASON - $ISVC_MESSAGE"
                   RESULT="FAILED"
+                fi
+              else
+                echo "InferenceService URL: $ISVC_URL"
+
+                # Test the status endpoint
+                echo "Testing inference service status endpoint..."
+                STATUS_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/v1/models" 2>&1)
+                STATUS_EXIT=$?
+
+                echo "Status response: $STATUS_RESPONSE"
+
+                if [ $STATUS_EXIT -eq 0 ] && echo "$STATUS_RESPONSE" | grep -q '"data"'; then
+                  echo "InferenceService status test PASSED"
+                  RESULT="PASSED"
+                else
+                  # Check if the service is at least reachable
+                  HEALTH_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/health" 2>&1)
+                  HEALTH_EXIT=$?
+
+                  if [ $HEALTH_EXIT -eq 0 ]; then
+                    echo "Health check passed"
+                    RESULT="PASSED"
+                  else
+                    ERROR_MSG="InferenceService endpoint unreachable"
+                    RESULT="FAILED"
+                  fi
                 fi
               fi
             fi
-          fi
 
-          # Output result
-          echo ""
+            # Output result
+            echo ""
+            echo "=========================================="
+            echo "Result for $MODEL_NAME: $RESULT"
+            if [ -n "$ERROR_MSG" ]; then
+              echo "Error: $ERROR_MSG"
+            fi
+            echo "=========================================="
+
+            # Save result to file for artifact upload
+            jq -n \
+              --arg model_name "$MODEL_NAME" \
+              --arg org "$ORG" \
+              --arg namespace "$NAMESPACE" \
+              --arg result "$RESULT" \
+              --arg error "$ERROR_MSG" \
+              '{
+                model_name: $model_name,
+                org: $org,
+                namespace: $namespace,
+                result: $result,
+                error: $error
+              }' > "test-results/${MODEL_NAME}.json"
+
+            # Cleanup resources for this model before moving to next
+            echo "Cleaning up resources for $MODEL_NAME..."
+
+            # Delete InferenceService first
+            kubectl delete inferenceservice "$MODEL_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+
+            # Wait for pods to terminate
+            sleep 10
+
+            # Delete cluster-scoped resources
+            kubectl delete -f "$RUNTIME_FILE" --ignore-not-found=true 2>/dev/null || true
+            kubectl delete -f "$MODEL_FILE" --ignore-not-found=true 2>/dev/null || true
+
+            echo "Cleanup completed for $MODEL_NAME"
+            echo ""
+          done
+
           echo "=========================================="
-          echo "Result for $MODEL_NAME: $RESULT"
-          if [ -n "$ERROR_MSG" ]; then
-            echo "Error: $ERROR_MSG"
-          fi
+          echo "Batch $BATCH_INDEX completed"
           echo "=========================================="
 
-          # Save result to file for artifact upload
-          mkdir -p test-results
-          jq -n \
-            --arg model_name "$MODEL_NAME" \
-            --arg org "$ORG" \
-            --arg namespace "$NAMESPACE" \
-            --arg result "$RESULT" \
-            --arg error "$ERROR_MSG" \
-            '{
-              model_name: $model_name,
-              org: $org,
-              namespace: $namespace,
-              result: $result,
-              error: $error
-            }' > "test-results/${MODEL_NAME}.json"
-
-          # Set exit code based on result (but don't fail the job)
-          if [ "$RESULT" = "FAILED" ]; then
-            echo "test_passed=false" >> $GITHUB_OUTPUT
-          else
-            echo "test_passed=true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Upload test result
+      - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-result-${{ matrix.model.model_name }}
+          name: test-results-batch-${{ matrix.batch.batch_index }}
           path: test-results/
           retention-days: 7
 
-      - name: Cleanup resources
-        if: always()
-        run: |
-          MODEL_NAME="${{ matrix.model.model_name }}"
-          NAMESPACE="${{ env.K8S_NAMESPACE }}"
-          MODEL_FILE="${{ matrix.model.model_file }}"
-          RUNTIME_FILE="${{ matrix.model.runtime_file }}"
-
-          echo "Cleaning up resources for $MODEL_NAME..."
-
-          # Delete InferenceService first
-          kubectl delete inferenceservice "$MODEL_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-
-          # Wait for pods to terminate
-          sleep 10
-
-          # Delete cluster-scoped resources
-          kubectl delete -f "$RUNTIME_FILE" --ignore-not-found=true 2>/dev/null || true
-          kubectl delete -f "$MODEL_FILE" --ignore-not-found=true 2>/dev/null || true
-
-          echo "Cleanup completed for $MODEL_NAME"
-
   summary:
-    needs: [discover-models, test-model]
+    needs: [discover-models, test-batch]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Download all test results
         uses: actions/download-artifact@v4
         with:
-          pattern: test-result-*
+          pattern: test-results-batch-*
           path: all-results
           merge-multiple: false
 
@@ -421,6 +465,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Run Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
           echo "**Total Models Discovered:** ${{ needs.discover-models.outputs.model_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Number of Batches:** ${{ needs.discover-models.outputs.batch_count }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Aggregate results from artifacts
@@ -435,7 +480,7 @@ jobs:
 
           # Process each result file
           if [ -d "all-results" ]; then
-            for result_dir in all-results/test-result-*; do
+            for result_dir in all-results/test-results-batch-*; do
               if [ -d "$result_dir" ]; then
                 for result_file in "$result_dir"/*.json; do
                   if [ -f "$result_file" ]; then
@@ -468,10 +513,10 @@ jobs:
 
           # If no results found, show the models that were supposed to be tested
           if [ $TOTAL -eq 0 ]; then
-            MODELS='${{ needs.discover-models.outputs.models }}'
-            if [ -n "$MODELS" ] && [ "$MODELS" != "[]" ]; then
-              echo "$MODELS" | jq -r '.[] | "| \(.model_name) | \(.org) | ⚠️ No result | See job logs |"' >> $GITHUB_STEP_SUMMARY
-              TOTAL=$(echo "$MODELS" | jq 'length')
+            BATCHES='${{ needs.discover-models.outputs.batches }}'
+            if [ -n "$BATCHES" ] && [ "$BATCHES" != "[]" ]; then
+              echo "$BATCHES" | jq -r '.[].models[] | "| \(.model_name) | \(.org) | ⚠️ No result | See job logs |"' >> $GITHUB_STEP_SUMMARY
+              TOTAL=$(echo "$BATCHES" | jq '[.[].models | length] | add')
             fi
           fi
 
@@ -491,6 +536,9 @@ jobs:
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Test Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Models are divided into batches to minimize Docker image pulls." >> $GITHUB_STEP_SUMMARY
+          echo "Each batch runs on a single runner and tests models sequentially." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Each model test performs the following steps:" >> $GITHUB_STEP_SUMMARY
           echo "1. **Apply Model YAML** - Creates the ClusterBaseModel resource" >> $GITHUB_STEP_SUMMARY
