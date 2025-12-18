@@ -13,7 +13,7 @@ on:
       max_parallel:
         description: "Maximum number of parallel runners (models will be batched)"
         required: false
-        default: "3"
+        default: "1"
         type: string
 
 env:
@@ -156,7 +156,7 @@ jobs:
           # Get max_parallel value
           MAX_PARALLEL="${{ github.event.inputs.max_parallel }}"
           if [ -z "$MAX_PARALLEL" ]; then
-            MAX_PARALLEL=5
+            MAX_PARALLEL=1
           fi
 
           echo "Max parallel runners: $MAX_PARALLEL"
