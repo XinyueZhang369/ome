@@ -17,7 +17,7 @@ on:
         type: string
 
 env:
-  K8S_NAMESPACE_PREFIX: model-test
+  K8S_NAMESPACE: actions-runner-system
 
 jobs:
   discover-models:
@@ -126,9 +126,6 @@ jobs:
             echo "  Service file: $service_file"
             echo "  Runtime name: $runtime_name"
 
-            # Create sanitized namespace name (lowercase, alphanumeric and hyphens only, max 63 chars)
-            namespace=$(echo "${K8S_NAMESPACE_PREFIX}-${model_name}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | cut -c1-63 | sed 's/-$//')
-
             # Add to JSON array
             MODEL_ENTRY=$(jq -n \
               --arg model_name "$model_name" \
@@ -136,7 +133,6 @@ jobs:
               --arg runtime_file "$runtime_file" \
               --arg runtime_name "$runtime_name" \
               --arg service_file "$service_file" \
-              --arg namespace "$namespace" \
               --arg org "$org" \
               '{
                 model_name: $model_name,
@@ -144,7 +140,6 @@ jobs:
                 runtime_file: $runtime_file,
                 runtime_name: $runtime_name,
                 service_file: $service_file,
-                namespace: $namespace,
                 org: $org
               }')
 
@@ -194,7 +189,7 @@ jobs:
           RUNTIME_FILE="${{ matrix.model.runtime_file }}"
           RUNTIME_NAME="${{ matrix.model.runtime_name }}"
           SERVICE_FILE="${{ matrix.model.service_file }}"
-          NAMESPACE="${{ matrix.model.namespace }}"
+          NAMESPACE="${{ env.K8S_NAMESPACE }}"
           ORG="${{ matrix.model.org }}"
 
           echo "=========================================="
@@ -210,18 +205,14 @@ jobs:
           SERVED_MODEL_NAME=$(grep -A1 -- "--served-model-name" "$RUNTIME_FILE" | tail -1 | sed 's/^[[:space:]]*- //' | tr -d '"' || echo "$MODEL_NAME")
           echo "Served model name: $SERVED_MODEL_NAME"
 
-          # Step 1: Create namespace
-          echo "Creating namespace: $NAMESPACE"
-          kubectl create namespace "$NAMESPACE" 2>/dev/null || echo "Namespace may already exist"
-
-          # Step 2: Apply model YAML
+          # Step 1: Apply model YAML
           echo "Applying model: $MODEL_FILE"
           if ! kubectl apply -f "$MODEL_FILE" 2>&1; then
             ERROR_MSG="Failed to apply model YAML"
             RESULT="FAILED"
           fi
 
-          # Step 3: Apply runtime YAML
+          # Step 2: Apply runtime YAML
           if [ "$RESULT" != "FAILED" ]; then
             echo "Applying runtime: $RUNTIME_FILE"
             if ! kubectl apply -f "$RUNTIME_FILE" 2>&1; then
@@ -230,7 +221,7 @@ jobs:
             fi
           fi
 
-          # Step 4: Apply service YAML (modify namespace if needed)
+          # Step 3: Apply service YAML (modify namespace to actions-runner-system)
           if [ "$RESULT" != "FAILED" ]; then
             echo "Applying service: $SERVICE_FILE"
             # Create a temp file with the namespace set
@@ -250,7 +241,7 @@ jobs:
             rm -f "$TEMP_SERVICE"
           fi
 
-          # Step 5: Wait for pods to be ready
+          # Step 4: Wait for pods to be ready
           if [ "$RESULT" != "FAILED" ]; then
             echo "Waiting for pods to be ready..."
             TIMEOUT=1800  # 30 minutes
@@ -301,7 +292,7 @@ jobs:
             fi
           fi
 
-          # Step 6: Test inference service status
+          # Step 5: Test inference service status
           if [ "$RESULT" != "FAILED" ]; then
             echo "Testing inference service status..."
 
@@ -394,10 +385,9 @@ jobs:
         if: always()
         run: |
           MODEL_NAME="${{ matrix.model.model_name }}"
-          NAMESPACE="${{ matrix.model.namespace }}"
+          NAMESPACE="${{ env.K8S_NAMESPACE }}"
           MODEL_FILE="${{ matrix.model.model_file }}"
           RUNTIME_FILE="${{ matrix.model.runtime_file }}"
-          SERVICE_FILE="${{ matrix.model.service_file }}"
 
           echo "Cleaning up resources for $MODEL_NAME..."
 
@@ -406,9 +396,6 @@ jobs:
 
           # Wait for pods to terminate
           sleep 10
-
-          # Delete namespace
-          kubectl delete namespace "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
 
           # Delete cluster-scoped resources
           kubectl delete -f "$RUNTIME_FILE" --ignore-not-found=true 2>/dev/null || true
@@ -508,10 +495,10 @@ jobs:
           echo "Each model test performs the following steps:" >> $GITHUB_STEP_SUMMARY
           echo "1. **Apply Model YAML** - Creates the ClusterBaseModel resource" >> $GITHUB_STEP_SUMMARY
           echo "2. **Apply Runtime YAML** - Creates the ClusterServingRuntime resource" >> $GITHUB_STEP_SUMMARY
-          echo "3. **Apply Service YAML** - Creates the InferenceService in a dedicated namespace" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Apply Service YAML** - Creates the InferenceService in actions-runner-system namespace" >> $GITHUB_STEP_SUMMARY
           echo "4. **Wait for Pods** - Waits up to 30 minutes for engine and router pods to be ready" >> $GITHUB_STEP_SUMMARY
           echo "5. **Test Status** - Tests InferenceService status URL or Ready condition" >> $GITHUB_STEP_SUMMARY
-          echo "6. **Cleanup** - Deletes all created resources" >> $GITHUB_STEP_SUMMARY
+          echo "6. **Cleanup** - Deletes InferenceService, Runtime, and Model resources" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Notes" >> $GITHUB_STEP_SUMMARY
           echo "- Models without corresponding runtime or service files were skipped during discovery" >> $GITHUB_STEP_SUMMARY
