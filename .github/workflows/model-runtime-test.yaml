@@ -366,9 +366,9 @@ jobs:
               fi
             fi
 
-            # Step 6: Test chat completions endpoint
+            # Step 6: Test model endpoint (chat completions or embeddings)
             if [ "$RESULT" = "PASSED" ]; then
-              echo "Testing chat completions endpoint..."
+              echo "Testing model endpoint..."
 
               # Get the InferenceService status URL
               ISVC_URL=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.url}' 2>/dev/null)
@@ -385,8 +385,10 @@ jobs:
                 fi
                 echo "Using model ID: $ACTUAL_MODEL_ID"
 
-                # Test /v1/chat/completions endpoint
-                echo "Calling /v1/chat/completions..."
+                ENDPOINT_TESTED=""
+
+                # Try /v1/chat/completions endpoint first
+                echo "Trying /v1/chat/completions..."
                 CHAT_RESPONSE=$(curl -s --max-time 120 "${ISVC_URL}/v1/chat/completions" \
                   -H "Content-Type: application/json" \
                   -d '{
@@ -397,13 +399,33 @@ jobs:
                   }' 2>&1)
                 CHAT_EXIT=$?
 
-                echo "Chat response: $CHAT_RESPONSE"
-
                 if [ $CHAT_EXIT -eq 0 ] && echo "$CHAT_RESPONSE" | grep -q '"choices"'; then
                   echo "Chat completions test PASSED"
+                  ENDPOINT_TESTED="chat"
                 else
-                  echo "Warning: Chat completions endpoint test failed (non-fatal)"
-                  echo "Response: $CHAT_RESPONSE"
+                  echo "Chat endpoint not available, trying embeddings endpoint..."
+
+                  # Try /v1/embeddings endpoint (for embedding models)
+                  EMBED_RESPONSE=$(curl -s --max-time 120 "${ISVC_URL}/v1/embeddings" \
+                    -H "Content-Type: application/json" \
+                    -d '{
+                      "model": "'"$ACTUAL_MODEL_ID"'",
+                      "input": "Hello world"
+                    }' 2>&1)
+                  EMBED_EXIT=$?
+
+                  if [ $EMBED_EXIT -eq 0 ] && echo "$EMBED_RESPONSE" | grep -q '"embedding"'; then
+                    echo "Embeddings test PASSED (this is an embedding model)"
+                    ENDPOINT_TESTED="embeddings"
+                  else
+                    echo "Warning: Neither chat nor embeddings endpoint responded successfully (non-fatal)"
+                    echo "Chat response: $CHAT_RESPONSE"
+                    echo "Embeddings response: $EMBED_RESPONSE"
+                  fi
+                fi
+
+                if [ -n "$ENDPOINT_TESTED" ]; then
+                  echo "Endpoint test completed successfully using: $ENDPOINT_TESTED"
                 fi
               else
                 echo "InferenceService URL not available, skipping endpoint test"
@@ -562,7 +584,7 @@ jobs:
           echo "3. **Apply Service YAML** - Creates the InferenceService in actions-runner-system namespace" >> $GITHUB_STEP_SUMMARY
           echo "4. **Wait for EngineReady** - Waits up to 60 minutes for InferenceService EngineReady condition" >> $GITHUB_STEP_SUMMARY
           echo "5. **Verify Pods** - Confirms engine and router pods are running" >> $GITHUB_STEP_SUMMARY
-          echo "6. **Test Chat** - Tests /v1/chat/completions endpoint with a simple prompt" >> $GITHUB_STEP_SUMMARY
+          echo "6. **Test Endpoint** - Tests /v1/chat/completions or /v1/embeddings depending on model type" >> $GITHUB_STEP_SUMMARY
           echo "7. **Cleanup** - Deletes InferenceService, Runtime, and Model resources" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Notes" >> $GITHUB_STEP_SUMMARY
