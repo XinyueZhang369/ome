@@ -294,30 +294,30 @@ jobs:
               rm -f "$TEMP_SERVICE"
             fi
 
-            # Step 4: Wait for InferenceService to be ready
+            # Step 4: Wait for InferenceService EngineReady condition
             if [ "$RESULT" != "FAILED" ]; then
-              echo "Waiting for InferenceService to be ready..."
+              echo "Waiting for InferenceService EngineReady condition..."
               TIMEOUT=3600  # 60 minutes
               ELAPSED=0
 
               while [ $ELAPSED -lt $TIMEOUT ]; do
-                ISVC_READY=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
-                ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || echo "")
+                ENGINE_READY=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="EngineReady")].status}' 2>/dev/null || echo "Unknown")
+                ENGINE_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="EngineReady")].reason}' 2>/dev/null || echo "")
 
-                echo "InferenceService Ready: $ISVC_READY (reason: $ISVC_REASON) - ${ELAPSED}s elapsed"
+                echo "InferenceService EngineReady: $ENGINE_READY (reason: $ENGINE_REASON) - ${ELAPSED}s elapsed"
 
-                if [ "$ISVC_READY" = "True" ]; then
-                  echo "InferenceService is ready!"
+                if [ "$ENGINE_READY" = "True" ]; then
+                  echo "InferenceService engine is ready!"
                   break
                 fi
 
                 # Check for terminal failure conditions
-                if [ "$ISVC_READY" = "False" ]; then
-                  ISVC_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "")
+                if [ "$ENGINE_READY" = "False" ]; then
+                  ENGINE_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="EngineReady")].message}' 2>/dev/null || echo "")
                   # Check if it's a permanent failure (not just pending)
-                  if echo "$ISVC_REASON" | grep -qE "RevisionFailed|ContainerCreating|Error"; then
-                    echo "InferenceService in error state: $ISVC_REASON - $ISVC_MESSAGE"
-                    ERROR_MSG="InferenceService failed: $ISVC_REASON - $ISVC_MESSAGE"
+                  if echo "$ENGINE_REASON" | grep -qE "RevisionFailed|ContainerCreating|Error|Failed"; then
+                    echo "InferenceService engine in error state: $ENGINE_REASON - $ENGINE_MESSAGE"
+                    ERROR_MSG="InferenceService engine failed: $ENGINE_REASON - $ENGINE_MESSAGE"
                     RESULT="FAILED"
                     break
                   fi
@@ -328,7 +328,7 @@ jobs:
               done
 
               if [ $ELAPSED -ge $TIMEOUT ] && [ "$RESULT" != "FAILED" ]; then
-                ERROR_MSG="Timeout waiting for InferenceService to be ready"
+                ERROR_MSG="Timeout waiting for InferenceService EngineReady"
                 RESULT="FAILED"
               fi
             fi
@@ -366,9 +366,9 @@ jobs:
               fi
             fi
 
-            # Step 6: Test inference service endpoint (optional)
+            # Step 6: Test chat completions endpoint
             if [ "$RESULT" = "PASSED" ]; then
-              echo "Testing inference service endpoint..."
+              echo "Testing chat completions endpoint..."
 
               # Get the InferenceService status URL
               ISVC_URL=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.url}' 2>/dev/null)
@@ -376,14 +376,34 @@ jobs:
               if [ -n "$ISVC_URL" ]; then
                 echo "InferenceService URL: $ISVC_URL"
 
-                # Test the /v1/models endpoint
-                STATUS_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/v1/models" 2>&1)
-                STATUS_EXIT=$?
+                # First get the model ID from /v1/models
+                MODELS_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/v1/models" 2>&1)
+                ACTUAL_MODEL_ID=$(echo "$MODELS_RESPONSE" | jq -r '.data[0].id // empty' 2>/dev/null)
 
-                if [ $STATUS_EXIT -eq 0 ] && echo "$STATUS_RESPONSE" | grep -q '"data"'; then
-                  echo "Endpoint /v1/models test passed"
+                if [ -z "$ACTUAL_MODEL_ID" ]; then
+                  ACTUAL_MODEL_ID="$MODEL_NAME"
+                fi
+                echo "Using model ID: $ACTUAL_MODEL_ID"
+
+                # Test /v1/chat/completions endpoint
+                echo "Calling /v1/chat/completions..."
+                CHAT_RESPONSE=$(curl -s --max-time 120 "${ISVC_URL}/v1/chat/completions" \
+                  -H "Content-Type: application/json" \
+                  -d '{
+                    "model": "'"$ACTUAL_MODEL_ID"'",
+                    "messages": [{"role": "user", "content": "Say hello in one word"}],
+                    "max_tokens": 10,
+                    "temperature": 0.7
+                  }' 2>&1)
+                CHAT_EXIT=$?
+
+                echo "Chat response: $CHAT_RESPONSE"
+
+                if [ $CHAT_EXIT -eq 0 ] && echo "$CHAT_RESPONSE" | grep -q '"choices"'; then
+                  echo "Chat completions test PASSED"
                 else
-                  echo "Warning: /v1/models endpoint not responding as expected (non-fatal)"
+                  echo "Warning: Chat completions endpoint test failed (non-fatal)"
+                  echo "Response: $CHAT_RESPONSE"
                 fi
               else
                 echo "InferenceService URL not available, skipping endpoint test"
@@ -540,14 +560,14 @@ jobs:
           echo "1. **Apply Model YAML** - Creates the ClusterBaseModel resource" >> $GITHUB_STEP_SUMMARY
           echo "2. **Apply Runtime YAML** - Creates the ClusterServingRuntime resource" >> $GITHUB_STEP_SUMMARY
           echo "3. **Apply Service YAML** - Creates the InferenceService in actions-runner-system namespace" >> $GITHUB_STEP_SUMMARY
-          echo "4. **Wait for InferenceService** - Waits up to 30 minutes for InferenceService Ready condition" >> $GITHUB_STEP_SUMMARY
+          echo "4. **Wait for EngineReady** - Waits up to 60 minutes for InferenceService EngineReady condition" >> $GITHUB_STEP_SUMMARY
           echo "5. **Verify Pods** - Confirms engine and router pods are running" >> $GITHUB_STEP_SUMMARY
-          echo "6. **Test Endpoint** - Optional test of /v1/models endpoint" >> $GITHUB_STEP_SUMMARY
+          echo "6. **Test Chat** - Tests /v1/chat/completions endpoint with a simple prompt" >> $GITHUB_STEP_SUMMARY
           echo "7. **Cleanup** - Deletes InferenceService, Runtime, and Model resources" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Notes" >> $GITHUB_STEP_SUMMARY
           echo "- Models without corresponding runtime or service files were skipped during discovery" >> $GITHUB_STEP_SUMMARY
-          echo "- Test passes when InferenceService Ready condition is True and pods are running" >> $GITHUB_STEP_SUMMARY
+          echo "- Test passes when InferenceService EngineReady condition is True and pods are running" >> $GITHUB_STEP_SUMMARY
           echo "- Check individual job logs for detailed output" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
