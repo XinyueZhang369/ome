@@ -1,0 +1,528 @@
+name: Model Runtime Test
+
+on:
+  push:
+    branches: [ xinyue/runtime-test ]
+  workflow_dispatch:
+    inputs:
+      filter_pattern:
+        description: "Optional regex pattern to filter model names (e.g., 'mistral|llama')"
+        required: false
+        default: ""
+        type: string
+      max_parallel:
+        description: "Maximum number of models to test in parallel"
+        required: false
+        default: "5"
+        type: string
+
+env:
+  K8S_NAMESPACE_PREFIX: model-test
+
+jobs:
+  discover-models:
+    runs-on: ubuntu-latest
+    outputs:
+      models: ${{ steps.discover.outputs.models }}
+      model_count: ${{ steps.discover.outputs.model_count }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Discover models with runtime and service files
+        id: discover
+        run: |
+          echo "Discovering models with matching runtime and service files..."
+
+          MODELS_JSON="[]"
+          MODEL_COUNT=0
+
+          # Find all model YAML files
+          for model_file in $(find config/models -name "*.yaml" -type f | sort); do
+            # Extract org and model filename
+            # Pattern: config/models/<org>/<model-name>.yaml
+            rel_path="${model_file#config/models/}"
+            org=$(dirname "$rel_path")
+            model_filename=$(basename "$rel_path" .yaml)
+
+            # Read the model name from the YAML metadata
+            model_name=$(grep -E "^  name:" "$model_file" | head -1 | awk '{print $2}' | tr -d '"')
+
+            if [ -z "$model_name" ]; then
+              echo "WARNING: Could not extract model name from $model_file, skipping..."
+              continue
+            fi
+
+            # Check for corresponding runtime file
+            # Runtime naming pattern: <model-name>-rt.yaml or srt-<model-name>-rt.yaml
+            runtime_file=""
+            for rt_pattern in "config/runtimes/srt/${org}/${model_name}-rt.yaml" \
+                             "config/runtimes/srt/${org}/$(echo "$model_filename" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g')-rt.yaml"; do
+              if [ -f "$rt_pattern" ]; then
+                runtime_file="$rt_pattern"
+                break
+              fi
+            done
+
+            # Try lowercase org name as well
+            if [ -z "$runtime_file" ]; then
+              org_lower=$(echo "$org" | tr '[:upper:]' '[:lower:]')
+              for rt_pattern in "config/runtimes/srt/${org_lower}/${model_name}-rt.yaml" \
+                               "config/runtimes/srt/${model_name}-rt.yaml"; do
+                if [ -f "$rt_pattern" ]; then
+                  runtime_file="$rt_pattern"
+                  break
+                fi
+              done
+            fi
+
+            if [ -z "$runtime_file" ]; then
+              echo "SKIP: No runtime file found for model $model_name (file: $model_file)"
+              continue
+            fi
+
+            # Check for corresponding service file
+            service_file=""
+            for svc_pattern in "config/samples/isvc/${org}/${model_name}.yaml" \
+                              "config/samples/isvc/${org}/$(echo "$model_filename" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g').yaml"; do
+              if [ -f "$svc_pattern" ]; then
+                service_file="$svc_pattern"
+                break
+              fi
+            done
+
+            # Try lowercase org name as well
+            if [ -z "$service_file" ]; then
+              org_lower=$(echo "$org" | tr '[:upper:]' '[:lower:]')
+              for svc_pattern in "config/samples/isvc/${org_lower}/${model_name}.yaml" \
+                                "config/samples/isvc/${model_name}.yaml"; do
+                if [ -f "$svc_pattern" ]; then
+                  service_file="$svc_pattern"
+                  break
+                fi
+              done
+            fi
+
+            if [ -z "$service_file" ]; then
+              echo "SKIP: No service file found for model $model_name (file: $model_file)"
+              continue
+            fi
+
+            # Extract runtime name from runtime file
+            runtime_name=$(grep -E "^  name:" "$runtime_file" | head -1 | awk '{print $2}' | tr -d '"')
+
+            # Apply filter pattern if specified
+            FILTER_PATTERN="${{ github.event.inputs.filter_pattern }}"
+            if [ -n "$FILTER_PATTERN" ]; then
+              if ! echo "$model_name" | grep -qE "$FILTER_PATTERN"; then
+                echo "SKIP: Model $model_name does not match filter pattern '$FILTER_PATTERN'"
+                continue
+              fi
+            fi
+
+            echo "FOUND: $model_name"
+            echo "  Model file: $model_file"
+            echo "  Runtime file: $runtime_file"
+            echo "  Service file: $service_file"
+            echo "  Runtime name: $runtime_name"
+
+            # Create sanitized namespace name (lowercase, alphanumeric and hyphens only, max 63 chars)
+            namespace=$(echo "${K8S_NAMESPACE_PREFIX}-${model_name}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | cut -c1-63 | sed 's/-$//')
+
+            # Add to JSON array
+            MODEL_ENTRY=$(jq -n \
+              --arg model_name "$model_name" \
+              --arg model_file "$model_file" \
+              --arg runtime_file "$runtime_file" \
+              --arg runtime_name "$runtime_name" \
+              --arg service_file "$service_file" \
+              --arg namespace "$namespace" \
+              --arg org "$org" \
+              '{
+                model_name: $model_name,
+                model_file: $model_file,
+                runtime_file: $runtime_file,
+                runtime_name: $runtime_name,
+                service_file: $service_file,
+                namespace: $namespace,
+                org: $org
+              }')
+
+            MODELS_JSON=$(echo "$MODELS_JSON" | jq --argjson entry "$MODEL_ENTRY" '. += [$entry]')
+            MODEL_COUNT=$((MODEL_COUNT + 1))
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "Total models found with runtime and service: $MODEL_COUNT"
+          echo "=========================================="
+
+          # Output for matrix strategy
+          echo "models=$(echo "$MODELS_JSON" | jq -c '.')" >> $GITHUB_OUTPUT
+          echo "model_count=$MODEL_COUNT" >> $GITHUB_OUTPUT
+
+          # Also output the full list for debugging
+          echo "Models to test:"
+          echo "$MODELS_JSON" | jq -r '.[].model_name'
+
+  test-model:
+    needs: discover-models
+    if: needs.discover-models.outputs.model_count != '0'
+    runs-on: k8s-runner
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(github.event.inputs.max_parallel || '5') }}
+      matrix:
+        model: ${{ fromJson(needs.discover-models.outputs.models) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.30.1'
+
+      - name: Test model - ${{ matrix.model.model_name }}
+        id: test
+        run: |
+          set +e  # Don't exit on error, we want to capture results
+
+          MODEL_NAME="${{ matrix.model.model_name }}"
+          MODEL_FILE="${{ matrix.model.model_file }}"
+          RUNTIME_FILE="${{ matrix.model.runtime_file }}"
+          RUNTIME_NAME="${{ matrix.model.runtime_name }}"
+          SERVICE_FILE="${{ matrix.model.service_file }}"
+          NAMESPACE="${{ matrix.model.namespace }}"
+          ORG="${{ matrix.model.org }}"
+
+          echo "=========================================="
+          echo "Testing model: $MODEL_NAME"
+          echo "Namespace: $NAMESPACE"
+          echo "=========================================="
+
+          # Initialize result
+          RESULT="PENDING"
+          ERROR_MSG=""
+
+          # Extract the served-model-name from the runtime file for API calls
+          SERVED_MODEL_NAME=$(grep -A1 -- "--served-model-name" "$RUNTIME_FILE" | tail -1 | sed 's/^[[:space:]]*- //' | tr -d '"' || echo "$MODEL_NAME")
+          echo "Served model name: $SERVED_MODEL_NAME"
+
+          # Step 1: Create namespace
+          echo "Creating namespace: $NAMESPACE"
+          kubectl create namespace "$NAMESPACE" 2>/dev/null || echo "Namespace may already exist"
+
+          # Step 2: Apply model YAML
+          echo "Applying model: $MODEL_FILE"
+          if ! kubectl apply -f "$MODEL_FILE" 2>&1; then
+            ERROR_MSG="Failed to apply model YAML"
+            RESULT="FAILED"
+          fi
+
+          # Step 3: Apply runtime YAML
+          if [ "$RESULT" != "FAILED" ]; then
+            echo "Applying runtime: $RUNTIME_FILE"
+            if ! kubectl apply -f "$RUNTIME_FILE" 2>&1; then
+              ERROR_MSG="Failed to apply runtime YAML"
+              RESULT="FAILED"
+            fi
+          fi
+
+          # Step 4: Apply service YAML (modify namespace if needed)
+          if [ "$RESULT" != "FAILED" ]; then
+            echo "Applying service: $SERVICE_FILE"
+            # Create a temp file with the namespace set
+            TEMP_SERVICE="/tmp/service-$MODEL_NAME.yaml"
+
+            # Read the service file and update namespace
+            cat "$SERVICE_FILE" | sed "s/namespace:.*/namespace: $NAMESPACE/" > "$TEMP_SERVICE"
+
+            # Also ensure minReplicas is at least 1 for engine
+            sed -i 's/minReplicas: 0/minReplicas: 1/' "$TEMP_SERVICE" 2>/dev/null || \
+              sed -i '' 's/minReplicas: 0/minReplicas: 1/' "$TEMP_SERVICE"
+
+            if ! kubectl apply -f "$TEMP_SERVICE" 2>&1; then
+              ERROR_MSG="Failed to apply service YAML"
+              RESULT="FAILED"
+            fi
+            rm -f "$TEMP_SERVICE"
+          fi
+
+          # Step 5: Wait for pods to be ready
+          if [ "$RESULT" != "FAILED" ]; then
+            echo "Waiting for pods to be ready..."
+            TIMEOUT=1800  # 30 minutes
+            ELAPSED=0
+            ENGINE_READY=false
+            ROUTER_READY=false
+
+            while [ $ELAPSED -lt $TIMEOUT ]; do
+              # Check engine pod
+              ENGINE_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+              ENGINE_READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+
+              # Check router pod
+              ROUTER_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+              ROUTER_READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+
+              echo "Engine: $ENGINE_STATUS (ready: $ENGINE_READY_COUNT), Router: $ROUTER_STATUS (ready: $ROUTER_READY_COUNT) - ${ELAPSED}s elapsed"
+
+              if [ "$ENGINE_READY_COUNT" = "true" ]; then
+                ENGINE_READY=true
+              fi
+
+              if [ "$ROUTER_READY_COUNT" = "true" ]; then
+                ROUTER_READY=true
+              fi
+
+              if [ "$ENGINE_READY" = "true" ] && [ "$ROUTER_READY" = "true" ]; then
+                echo "All pods are ready!"
+                break
+              fi
+
+              # Check for CrashLoopBackOff or Error
+              POD_STATUSES=$(kubectl get pods -n "$NAMESPACE" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || echo "")
+              if echo "$POD_STATUSES" | grep -qE "CrashLoopBackOff|ImagePullBackOff|ErrImagePull"; then
+                echo "Pod in error state: $POD_STATUSES"
+                ERROR_MSG="Pod failed: $POD_STATUSES"
+                RESULT="FAILED"
+                break
+              fi
+
+              sleep 30
+              ELAPSED=$((ELAPSED + 30))
+            done
+
+            if [ $ELAPSED -ge $TIMEOUT ] && [ "$RESULT" != "FAILED" ]; then
+              ERROR_MSG="Timeout waiting for pods to be ready"
+              RESULT="FAILED"
+            fi
+          fi
+
+          # Step 6: Test inference service status
+          if [ "$RESULT" != "FAILED" ]; then
+            echo "Testing inference service status..."
+
+            # Get the InferenceService status URL
+            ISVC_URL=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.url}' 2>/dev/null)
+
+            if [ -z "$ISVC_URL" ]; then
+              echo "InferenceService URL not found, checking status directly..."
+              ISVC_STATUS=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+
+              if [ "$ISVC_STATUS" = "True" ]; then
+                echo "InferenceService is Ready"
+                RESULT="PASSED"
+              else
+                ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
+                ISVC_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null)
+                ERROR_MSG="InferenceService not ready: $ISVC_REASON - $ISVC_MESSAGE"
+                RESULT="FAILED"
+              fi
+            else
+              echo "InferenceService URL: $ISVC_URL"
+
+              # Test the status endpoint
+              echo "Testing inference service status endpoint..."
+              STATUS_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/v1/models" 2>&1)
+              STATUS_EXIT=$?
+
+              echo "Status response: $STATUS_RESPONSE"
+
+              if [ $STATUS_EXIT -eq 0 ] && echo "$STATUS_RESPONSE" | grep -q '"data"'; then
+                echo "InferenceService status test PASSED"
+                RESULT="PASSED"
+              else
+                # Check if the service is at least reachable
+                HEALTH_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/health" 2>&1)
+                HEALTH_EXIT=$?
+
+                if [ $HEALTH_EXIT -eq 0 ]; then
+                  echo "Health check passed"
+                  RESULT="PASSED"
+                else
+                  ERROR_MSG="InferenceService endpoint unreachable"
+                  RESULT="FAILED"
+                fi
+              fi
+            fi
+          fi
+
+          # Output result
+          echo ""
+          echo "=========================================="
+          echo "Result for $MODEL_NAME: $RESULT"
+          if [ -n "$ERROR_MSG" ]; then
+            echo "Error: $ERROR_MSG"
+          fi
+          echo "=========================================="
+
+          # Save result to file for artifact upload
+          mkdir -p test-results
+          jq -n \
+            --arg model_name "$MODEL_NAME" \
+            --arg org "$ORG" \
+            --arg namespace "$NAMESPACE" \
+            --arg result "$RESULT" \
+            --arg error "$ERROR_MSG" \
+            '{
+              model_name: $model_name,
+              org: $org,
+              namespace: $namespace,
+              result: $result,
+              error: $error
+            }' > "test-results/${MODEL_NAME}.json"
+
+          # Set exit code based on result (but don't fail the job)
+          if [ "$RESULT" = "FAILED" ]; then
+            echo "test_passed=false" >> $GITHUB_OUTPUT
+          else
+            echo "test_passed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload test result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-result-${{ matrix.model.model_name }}
+          path: test-results/
+          retention-days: 7
+
+      - name: Cleanup resources
+        if: always()
+        run: |
+          MODEL_NAME="${{ matrix.model.model_name }}"
+          NAMESPACE="${{ matrix.model.namespace }}"
+          MODEL_FILE="${{ matrix.model.model_file }}"
+          RUNTIME_FILE="${{ matrix.model.runtime_file }}"
+          SERVICE_FILE="${{ matrix.model.service_file }}"
+
+          echo "Cleaning up resources for $MODEL_NAME..."
+
+          # Delete InferenceService first
+          kubectl delete inferenceservice "$MODEL_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+
+          # Wait for pods to terminate
+          sleep 10
+
+          # Delete namespace
+          kubectl delete namespace "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+
+          # Delete cluster-scoped resources
+          kubectl delete -f "$RUNTIME_FILE" --ignore-not-found=true 2>/dev/null || true
+          kubectl delete -f "$MODEL_FILE" --ignore-not-found=true 2>/dev/null || true
+
+          echo "Cleanup completed for $MODEL_NAME"
+
+  summary:
+    needs: [discover-models, test-model]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all test results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test-result-*
+          path: all-results
+          merge-multiple: false
+
+      - name: Generate summary
+        run: |
+          echo "## Model Runtime Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Total Models Discovered:** ${{ needs.discover-models.outputs.model_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Aggregate results from artifacts
+          PASSED=0
+          FAILED=0
+          TOTAL=0
+
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Model | Organization | Status | Error |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+
+          # Process each result file
+          if [ -d "all-results" ]; then
+            for result_dir in all-results/test-result-*; do
+              if [ -d "$result_dir" ]; then
+                for result_file in "$result_dir"/*.json; do
+                  if [ -f "$result_file" ]; then
+                    MODEL_NAME=$(jq -r '.model_name' "$result_file")
+                    ORG=$(jq -r '.org' "$result_file")
+                    RESULT=$(jq -r '.result' "$result_file")
+                    ERROR=$(jq -r '.error // ""' "$result_file")
+
+                    TOTAL=$((TOTAL + 1))
+
+                    if [ "$RESULT" = "PASSED" ]; then
+                      PASSED=$((PASSED + 1))
+                      STATUS_EMOJI="✅"
+                    else
+                      FAILED=$((FAILED + 1))
+                      STATUS_EMOJI="❌"
+                    fi
+
+                    # Truncate error message if too long
+                    if [ ${#ERROR} -gt 50 ]; then
+                      ERROR="${ERROR:0:47}..."
+                    fi
+
+                    echo "| $MODEL_NAME | $ORG | $STATUS_EMOJI $RESULT | $ERROR |" >> $GITHUB_STEP_SUMMARY
+                  fi
+                done
+              fi
+            done
+          fi
+
+          # If no results found, show the models that were supposed to be tested
+          if [ $TOTAL -eq 0 ]; then
+            MODELS='${{ needs.discover-models.outputs.models }}'
+            if [ -n "$MODELS" ] && [ "$MODELS" != "[]" ]; then
+              echo "$MODELS" | jq -r '.[] | "| \(.model_name) | \(.org) | ⚠️ No result | See job logs |"' >> $GITHUB_STEP_SUMMARY
+              TOTAL=$(echo "$MODELS" | jq 'length')
+            fi
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Summary Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Tested | $TOTAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ Passed | $PASSED |" >> $GITHUB_STEP_SUMMARY
+          echo "| ❌ Failed | $FAILED |" >> $GITHUB_STEP_SUMMARY
+
+          if [ $TOTAL -gt 0 ]; then
+            PASS_RATE=$((PASSED * 100 / TOTAL))
+            echo "| Pass Rate | ${PASS_RATE}% |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Each model test performs the following steps:" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Apply Model YAML** - Creates the ClusterBaseModel resource" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Apply Runtime YAML** - Creates the ClusterServingRuntime resource" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Apply Service YAML** - Creates the InferenceService in a dedicated namespace" >> $GITHUB_STEP_SUMMARY
+          echo "4. **Wait for Pods** - Waits up to 30 minutes for engine and router pods to be ready" >> $GITHUB_STEP_SUMMARY
+          echo "5. **Test Status** - Tests InferenceService status URL or Ready condition" >> $GITHUB_STEP_SUMMARY
+          echo "6. **Cleanup** - Deletes all created resources" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Notes" >> $GITHUB_STEP_SUMMARY
+          echo "- Models without corresponding runtime or service files were skipped during discovery" >> $GITHUB_STEP_SUMMARY
+          echo "- Each model is tested by checking InferenceService status URL or Ready condition" >> $GITHUB_STEP_SUMMARY
+          echo "- Check individual job logs for detailed output" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "_Generated by Model Runtime Test workflow_" >> $GITHUB_STEP_SUMMARY
+
+          # Fail the job if any tests failed
+          if [ $FAILED -gt 0 ]; then
+            echo "::error::$FAILED out of $TOTAL tests failed"
+            exit 1
+          fi
