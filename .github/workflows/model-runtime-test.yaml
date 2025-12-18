@@ -311,11 +311,18 @@ jobs:
             # Step 4: Apply service YAML
             if [ "$RESULT" != "FAILED" ]; then
               echo "Applying service: $SERVICE_FILE"
-              # Create a temp file with namespace removed and minReplicas fixed
+              # Create a temp file with Namespace resource and namespace field removed, and minReplicas fixed
               TEMP_SERVICE="/tmp/service-$MODEL_NAME.yaml"
 
-              # Remove namespace field if present and ensure minReplicas is at least 1
-              cat "$SERVICE_FILE" | grep -v "^  namespace:" | sed 's/minReplicas: 0/minReplicas: 1/' > "$TEMP_SERVICE"
+              # Remove Namespace resource (kind: Namespace), namespace field, and fix minReplicas
+              awk '
+                BEGIN { skip=0 }
+                /^---/ { skip=0; next }
+                /^kind:[[:space:]]*Namespace/ { skip=1 }
+                skip { next }
+                /^[[:space:]]*namespace:/ { next }
+                { print }
+              ' "$SERVICE_FILE" | sed 's/minReplicas: 0/minReplicas: 1/' > "$TEMP_SERVICE"
 
               if ! kubectl apply -f "$TEMP_SERVICE" -n "$NAMESPACE" 2>&1; then
                 ERROR_MSG="Failed to apply service YAML"
