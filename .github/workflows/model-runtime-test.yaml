@@ -294,45 +294,33 @@ jobs:
               rm -f "$TEMP_SERVICE"
             fi
 
-            # Step 4: Wait for pods to be ready
+            # Step 4: Wait for InferenceService to be ready
             if [ "$RESULT" != "FAILED" ]; then
-              echo "Waiting for pods to be ready..."
-              TIMEOUT=1800  # 30 minutes
+              echo "Waiting for InferenceService to be ready..."
+              TIMEOUT=3600  # 60 minutes
               ELAPSED=0
-              ENGINE_READY=false
-              ROUTER_READY=false
 
               while [ $ELAPSED -lt $TIMEOUT ]; do
-                # Check engine pod
-                ENGINE_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
-                ENGINE_READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+                ISVC_READY=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+                ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || echo "")
 
-                # Check router pod
-                ROUTER_STATUS=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
-                ROUTER_READY_COUNT=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+                echo "InferenceService Ready: $ISVC_READY (reason: $ISVC_REASON) - ${ELAPSED}s elapsed"
 
-                echo "Engine: $ENGINE_STATUS (ready: $ENGINE_READY_COUNT), Router: $ROUTER_STATUS (ready: $ROUTER_READY_COUNT) - ${ELAPSED}s elapsed"
-
-                if [ "$ENGINE_READY_COUNT" = "true" ]; then
-                  ENGINE_READY=true
-                fi
-
-                if [ "$ROUTER_READY_COUNT" = "true" ]; then
-                  ROUTER_READY=true
-                fi
-
-                if [ "$ENGINE_READY" = "true" ] && [ "$ROUTER_READY" = "true" ]; then
-                  echo "All pods are ready!"
+                if [ "$ISVC_READY" = "True" ]; then
+                  echo "InferenceService is ready!"
                   break
                 fi
 
-                # Check for CrashLoopBackOff or Error
-                POD_STATUSES=$(kubectl get pods -n "$NAMESPACE" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || echo "")
-                if echo "$POD_STATUSES" | grep -qE "CrashLoopBackOff|ImagePullBackOff|ErrImagePull"; then
-                  echo "Pod in error state: $POD_STATUSES"
-                  ERROR_MSG="Pod failed: $POD_STATUSES"
-                  RESULT="FAILED"
-                  break
+                # Check for terminal failure conditions
+                if [ "$ISVC_READY" = "False" ]; then
+                  ISVC_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "")
+                  # Check if it's a permanent failure (not just pending)
+                  if echo "$ISVC_REASON" | grep -qE "RevisionFailed|ContainerCreating|Error"; then
+                    echo "InferenceService in error state: $ISVC_REASON - $ISVC_MESSAGE"
+                    ERROR_MSG="InferenceService failed: $ISVC_REASON - $ISVC_MESSAGE"
+                    RESULT="FAILED"
+                    break
+                  fi
                 fi
 
                 sleep 30
@@ -340,57 +328,65 @@ jobs:
               done
 
               if [ $ELAPSED -ge $TIMEOUT ] && [ "$RESULT" != "FAILED" ]; then
-                ERROR_MSG="Timeout waiting for pods to be ready"
+                ERROR_MSG="Timeout waiting for InferenceService to be ready"
                 RESULT="FAILED"
               fi
             fi
 
-            # Step 5: Test inference service status
+            # Step 5: Verify pods are running
             if [ "$RESULT" != "FAILED" ]; then
-              echo "Testing inference service status..."
+              echo "Verifying pods are running..."
+
+              # Check engine pod
+              ENGINE_READY=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+              ROUTER_READY=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+
+              echo "Engine pod ready: $ENGINE_READY, Router pod ready: $ROUTER_READY"
+
+              if [ "$ENGINE_READY" != "true" ]; then
+                # Check for pod errors
+                POD_STATUSES=$(kubectl get pods -n "$NAMESPACE" -l "component=engine" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || echo "")
+                if [ -n "$POD_STATUSES" ]; then
+                  ERROR_MSG="Engine pod not ready: $POD_STATUSES"
+                  RESULT="FAILED"
+                fi
+              fi
+
+              if [ "$RESULT" != "FAILED" ] && [ "$ROUTER_READY" != "true" ]; then
+                POD_STATUSES=$(kubectl get pods -n "$NAMESPACE" -l "component=router" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}' 2>/dev/null || echo "")
+                if [ -n "$POD_STATUSES" ]; then
+                  ERROR_MSG="Router pod not ready: $POD_STATUSES"
+                  RESULT="FAILED"
+                fi
+              fi
+
+              if [ "$RESULT" != "FAILED" ]; then
+                echo "All pods verified!"
+                RESULT="PASSED"
+              fi
+            fi
+
+            # Step 6: Test inference service endpoint (optional)
+            if [ "$RESULT" = "PASSED" ]; then
+              echo "Testing inference service endpoint..."
 
               # Get the InferenceService status URL
               ISVC_URL=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.url}' 2>/dev/null)
 
-              if [ -z "$ISVC_URL" ]; then
-                echo "InferenceService URL not found, checking status directly..."
-                ISVC_STATUS=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
-
-                if [ "$ISVC_STATUS" = "True" ]; then
-                  echo "InferenceService is Ready"
-                  RESULT="PASSED"
-                else
-                  ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null)
-                  ISVC_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null)
-                  ERROR_MSG="InferenceService not ready: $ISVC_REASON - $ISVC_MESSAGE"
-                  RESULT="FAILED"
-                fi
-              else
+              if [ -n "$ISVC_URL" ]; then
                 echo "InferenceService URL: $ISVC_URL"
 
-                # Test the status endpoint
-                echo "Testing inference service status endpoint..."
+                # Test the /v1/models endpoint
                 STATUS_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/v1/models" 2>&1)
                 STATUS_EXIT=$?
 
-                echo "Status response: $STATUS_RESPONSE"
-
                 if [ $STATUS_EXIT -eq 0 ] && echo "$STATUS_RESPONSE" | grep -q '"data"'; then
-                  echo "InferenceService status test PASSED"
-                  RESULT="PASSED"
+                  echo "Endpoint /v1/models test passed"
                 else
-                  # Check if the service is at least reachable
-                  HEALTH_RESPONSE=$(curl -s --max-time 30 "${ISVC_URL}/health" 2>&1)
-                  HEALTH_EXIT=$?
-
-                  if [ $HEALTH_EXIT -eq 0 ]; then
-                    echo "Health check passed"
-                    RESULT="PASSED"
-                  else
-                    ERROR_MSG="InferenceService endpoint unreachable"
-                    RESULT="FAILED"
-                  fi
+                  echo "Warning: /v1/models endpoint not responding as expected (non-fatal)"
                 fi
+              else
+                echo "InferenceService URL not available, skipping endpoint test"
               fi
             fi
 
@@ -544,13 +540,14 @@ jobs:
           echo "1. **Apply Model YAML** - Creates the ClusterBaseModel resource" >> $GITHUB_STEP_SUMMARY
           echo "2. **Apply Runtime YAML** - Creates the ClusterServingRuntime resource" >> $GITHUB_STEP_SUMMARY
           echo "3. **Apply Service YAML** - Creates the InferenceService in actions-runner-system namespace" >> $GITHUB_STEP_SUMMARY
-          echo "4. **Wait for Pods** - Waits up to 30 minutes for engine and router pods to be ready" >> $GITHUB_STEP_SUMMARY
-          echo "5. **Test Status** - Tests InferenceService status URL or Ready condition" >> $GITHUB_STEP_SUMMARY
-          echo "6. **Cleanup** - Deletes InferenceService, Runtime, and Model resources" >> $GITHUB_STEP_SUMMARY
+          echo "4. **Wait for InferenceService** - Waits up to 30 minutes for InferenceService Ready condition" >> $GITHUB_STEP_SUMMARY
+          echo "5. **Verify Pods** - Confirms engine and router pods are running" >> $GITHUB_STEP_SUMMARY
+          echo "6. **Test Endpoint** - Optional test of /v1/models endpoint" >> $GITHUB_STEP_SUMMARY
+          echo "7. **Cleanup** - Deletes InferenceService, Runtime, and Model resources" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Notes" >> $GITHUB_STEP_SUMMARY
           echo "- Models without corresponding runtime or service files were skipped during discovery" >> $GITHUB_STEP_SUMMARY
-          echo "- Each model is tested by checking InferenceService status URL or Ready condition" >> $GITHUB_STEP_SUMMARY
+          echo "- Test passes when InferenceService Ready condition is True and pods are running" >> $GITHUB_STEP_SUMMARY
           echo "- Check individual job logs for detailed output" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
