@@ -324,17 +324,17 @@ jobs:
               rm -f "$TEMP_SERVICE"
             fi
 
-            # Step 5: Wait for InferenceService EngineReady and Ready conditions
+            # Step 5: Wait for InferenceService EngineReady and RouterReady conditions
             if [ "$RESULT" != "FAILED" ]; then
-              echo "Waiting for InferenceService EngineReady and Ready conditions..."
+              echo "Waiting for InferenceService EngineReady and RouterReady conditions..."
               TIMEOUT=600  # 10 minutes
               ELAPSED=0
 
               while [ $ELAPSED -lt $TIMEOUT ]; do
                 ENGINE_READY=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="EngineReady")].status}' 2>/dev/null || echo "Unknown")
                 ENGINE_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="EngineReady")].reason}' 2>/dev/null || echo "")
-                ISVC_READY=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
-                ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || echo "")
+                ISVC_READY=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="RouterReady")].status}' 2>/dev/null || echo "Unknown")
+                ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="RouterReady")].reason}' 2>/dev/null || echo "")
 
                 echo "InferenceService EngineReady: $ENGINE_READY (reason: $ENGINE_REASON), Ready: $ISVC_READY (reason: $ISVC_REASON) - ${ELAPSED}s elapsed"
 
@@ -360,8 +360,8 @@ jobs:
                   ISVC_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "")
                   # Check if it's a permanent failure (not just pending)
                   if echo "$ISVC_REASON" | grep -qE "RevisionFailed|Error|Failed"; then
-                    echo "InferenceService in error state: $ISVC_REASON - $ISVC_MESSAGE"
-                    ERROR_MSG="InferenceService failed: $ISVC_REASON - $ISVC_MESSAGE"
+                    echo "InferenceService router in error state: $ISVC_REASON - $ISVC_MESSAGE"
+                    ERROR_MSG="InferenceService router failed: $ISVC_REASON - $ISVC_MESSAGE"
                     RESULT="FAILED"
                     break
                   fi
