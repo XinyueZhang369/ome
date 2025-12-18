@@ -324,24 +324,26 @@ jobs:
               rm -f "$TEMP_SERVICE"
             fi
 
-            # Step 5: Wait for InferenceService EngineReady condition
+            # Step 5: Wait for InferenceService EngineReady and Ready conditions
             if [ "$RESULT" != "FAILED" ]; then
-              echo "Waiting for InferenceService EngineReady condition..."
+              echo "Waiting for InferenceService EngineReady and Ready conditions..."
               TIMEOUT=600  # 10 minutes
               ELAPSED=0
 
               while [ $ELAPSED -lt $TIMEOUT ]; do
                 ENGINE_READY=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="EngineReady")].status}' 2>/dev/null || echo "Unknown")
                 ENGINE_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="EngineReady")].reason}' 2>/dev/null || echo "")
+                ISVC_READY=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+                ISVC_REASON=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || echo "")
 
-                echo "InferenceService EngineReady: $ENGINE_READY (reason: $ENGINE_REASON) - ${ELAPSED}s elapsed"
+                echo "InferenceService EngineReady: $ENGINE_READY (reason: $ENGINE_REASON), Ready: $ISVC_READY (reason: $ISVC_REASON) - ${ELAPSED}s elapsed"
 
-                if [ "$ENGINE_READY" = "True" ]; then
-                  echo "InferenceService engine is ready!"
+                if [ "$ENGINE_READY" = "True" ] && [ "$ISVC_READY" = "True" ]; then
+                  echo "InferenceService is ready!"
                   break
                 fi
 
-                # Check for terminal failure conditions
+                # Check for terminal failure conditions on EngineReady
                 if [ "$ENGINE_READY" = "False" ]; then
                   ENGINE_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="EngineReady")].message}' 2>/dev/null || echo "")
                   # Check if it's a permanent failure (not just pending)
@@ -353,12 +355,24 @@ jobs:
                   fi
                 fi
 
+                # Check for terminal failure conditions on Ready
+                if [ "$ISVC_READY" = "False" ]; then
+                  ISVC_MESSAGE=$(kubectl get inferenceservice "$MODEL_NAME" -n "$NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "")
+                  # Check if it's a permanent failure (not just pending)
+                  if echo "$ISVC_REASON" | grep -qE "RevisionFailed|Error|Failed"; then
+                    echo "InferenceService in error state: $ISVC_REASON - $ISVC_MESSAGE"
+                    ERROR_MSG="InferenceService failed: $ISVC_REASON - $ISVC_MESSAGE"
+                    RESULT="FAILED"
+                    break
+                  fi
+                fi
+
                 sleep 20
                 ELAPSED=$((ELAPSED + 20))
               done
 
               if [ $ELAPSED -ge $TIMEOUT ] && [ "$RESULT" != "FAILED" ]; then
-                ERROR_MSG="Timeout waiting for InferenceService EngineReady"
+                ERROR_MSG="Timeout waiting for InferenceService EngineReady and Ready"
                 RESULT="FAILED"
               fi
             fi
