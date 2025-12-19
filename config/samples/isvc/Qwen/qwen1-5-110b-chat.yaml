@@ -4,6 +4,8 @@ metadata:
   name: qwen1-5-110b-chat
   namespace: qwen1-5-110b-chat
 spec:
+  runtime:
+    name: srt-qwen1-5-110b-chat
   model:
     name: qwen1-5-110b-chat
   engine:

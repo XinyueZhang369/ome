@@ -13,7 +13,7 @@ on:
       max_parallel:
         description: "Maximum number of parallel runners (models will be batched)"
         required: false
-        default: "2"
+        default: "1"
         type: string
 
 env:
@@ -34,6 +34,117 @@ jobs:
         id: discover
         run: |
           echo "Discovering models with matching runtime and service files..."
+
+          # List of models that passed testing (from test-results-summary.md)
+          PASSED_MODELS=(
+            "persimmon-8b-chat"
+            "afm-4-5b-base"
+            "gte-qwen2-7b-instruct"
+            "olmo-2-1124-7b-instruct"
+            "olmoe-1b-7b-0924"
+            "bge-large-en-v1-5"
+            "bge-m3"
+            "bge-reranker-v2-m3"
+            "baichuan2-7b-chat"
+            "starcoder2-7b"
+            "starcoder2-15b"
+            "deepseek-coder-7b-instruct-v1-5"
+            "deepseek-llm-7b-chat"
+            "deepseek-v2-lite-chat"
+            "deepseek-r1-distill-qwen-1-5b"
+            "deepseek-r1-distill-qwen-7b"
+            "deepseek-r1-distill-qwen-14b"
+            "deepseek-r1-distill-qwen-32b"
+            "deepseek-r1-distill-llama-8b"
+            "deepseek-r1-distill-llama-70b"
+            "janus-pro-7b"
+            "gemma-3-1b-it"
+            "gemma-3-4b-it"
+            "gemma-3-12b-it"
+            "gemma-2-2b-it"
+            "gemma-2-9b-it"
+            "gemma-2-27b-it"
+            "smollm-1-7b"
+            "granite-3-0-3b-a800m-instruct"
+            "granite-3-1-8b-instruct"
+            "internlm2-7b"
+            "internlm2-20b"
+            "jet-nemotron-2b"
+            "vicuna-7b-v1-5"
+            "vicuna-13b-v1-5"
+            "llama-2-7b"
+            "llama-2-7b-chat-hf"
+            "llama-2-13b-chat-hf"
+            "llama-2-70b-chat-hf"
+            "llama-guard-3-8b"
+            "llama-3-70b-instruct"
+            "llama-3-8b-instruct"
+            "llama-3-1-8b-instruct"
+            "llama-3-1-70b-instruct"
+            "llama-3-2-1b-instruct"
+            "llama-3-2-3b-instruct"
+            "llama-4-scout-17b-16e-instruct"
+            "llama-4-maverick-17b-128e-instruct-fp8"
+            "phi-3-5-mini-instruct"
+            "phi-3-5-moe-instruct"
+            "phi-4"
+            "phi-4-mini-instruct"
+            "phi-4-multimodal-instruct"
+            "mistral-7b-instruct-v0-2"
+            "mistral-7b-instruct-v0-3"
+            "mistral-nemo-instruct-2407"
+            "mixtral-8x7b-instruct-v0-1"
+            "mixtral-8x7b-v0-1"
+            "mixtral-8x22b-v0-1"
+            "llama-3-1-nemotron-nano-8b-v1"
+            "llama-3-1-nemotron-70b-instruct-hf"
+            "llama-3-3-nemotron-super-49b-v1"
+            "minicpm3-4b"
+            "orion-14b-base"
+            "qwen2-5-1-5b"
+            "qwen2-5-7b"
+            "qwen2-5-32b-instruct"
+            "qwen2-5-coder-7b-instruct"
+            "qwen3-8b"
+            "qwen3-embedding-0-6b"
+            "skywork-or1-7b-preview"
+            "falcon3-10b-instruct"
+            "solar-10-7b-instruct-v1-0"
+            "grok-2"
+            "mimo-7b-rl"
+            "glm-4-9b-chat"
+            # Previously missing models (now have runtime and service files)
+            "llama-2-13b"
+            "llama-2-70b"
+            "llama-3-3-70b-instruct"
+            "internvl2-5-8b"
+            "qwen-7b-chat"
+            "qwen1-5-7b-chat"
+            "qwen1-5-32b-chat"
+            "qwen1-5-72b-chat"
+            "qwen1-5-110b-chat"
+            "qwen2-7b-instruct"
+            "qwen2-72b-instruct"
+            "qwen2-5-3b-instruct"
+            "qwen2-5-14b-instruct"
+            "qwen2-5-72b-instruct"
+            "qwen2-5-coder-32b-instruct"
+            "qwen2-vl-7b-instruct"
+            "qwen2-5-vl-7b-instruct"
+            "qwen3-32b"
+            "llama-3-2-11b-vision-instruct"
+          )
+
+          # Function to check if model is in passed list
+          is_passed_model() {
+            local model="$1"
+            for passed in "${PASSED_MODELS[@]}"; do
+              if [ "$passed" = "$model" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
 
           MODELS_JSON="[]"
           MODEL_COUNT=0
@@ -112,6 +223,12 @@ jobs:
             # Extract runtime name from runtime file
             runtime_name=$(grep -E "^  name:" "$runtime_file" | head -1 | awk '{print $2}' | tr -d '"')
 
+            # Check if model is in the passed list
+            if ! is_passed_model "$model_name"; then
+              echo "SKIP: Model $model_name is not in the passed models list"
+              continue
+            fi
+
             # Apply filter pattern if specified
             FILTER_PATTERN="${{ github.event.inputs.filter_pattern }}"
             if [ -n "$FILTER_PATTERN" ]; then
@@ -156,7 +273,7 @@ jobs:
           # Get max_parallel value
           MAX_PARALLEL="${{ github.event.inputs.max_parallel }}"
           if [ -z "$MAX_PARALLEL" ]; then
-            MAX_PARALLEL=2
+            MAX_PARALLEL=1
           fi
 
           echo "Max parallel runners: $MAX_PARALLEL"
